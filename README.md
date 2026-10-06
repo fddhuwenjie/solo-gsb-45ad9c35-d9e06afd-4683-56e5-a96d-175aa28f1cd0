@@ -33,7 +33,8 @@ python wsgi.py          # http://localhost:8000
 `gap_open=1e20`、`gap_extend=9.99999999999e19`（真实分差仅 3052 个浮点
 ULP）下 3×1 仍只算首/末层两个归属”两类伪并列反例，以及大数值真并列
 （含锁定标志层、多段组合）保留、容差边界和多标志层分段锚点组合用例；
-另含三个端到端 HTTP 用例，无 Flask 时自动跳过）：
+另有纯 SQLite 的写锁串行化用例（无需 Flask），以及端到端 HTTP 用例
+（并列定案、极大惩罚、编辑/失效并发窗口回归，无 Flask 时自动跳过））：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -191,6 +192,123 @@ curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
 # 期望：solution_count = 6，含一个 pairs=[]、unref=[1,2]、unhole=[1,2] 的“全部未匹配”归属
 ```
 
+### 复现“编辑提交与结果失效的并发窗口”反例
+
+修复前，`PUT /api/settings`（钻孔/层段、标志层编辑同理）把**业务数据写入**
+与**清除旧结果/旧定案**分成两个数据库事务。前一事务已提交、后一事务未提交
+之间存在一个窗口：
+
+1. 窗口内旧页面仍可用原 `run_id` 向 `POST /api/decisions` 定案并收到 **200**，
+   紧接着被迟到的失效事务抹掉——客户端被“成功”欺骗；
+2. 窗口内 `POST /api/correlate` 若算出新 `run_id` 并发布，迟到的失效事务又会
+   **删掉这份新结果**（`GET /api/state` 里结果凭空消失）；
+3. 轮询 `GET /api/state` 还能看到“新参数 + 旧 `run_id` 结果”的混合中间态；
+   定案的“读 `run_id` 校验”与“写库”之间也可能被编辑/重算的提交插入
+   （多 gunicorn worker 进程下同样成立）。
+
+修复后：编辑与失效在**同一个事务**中提交（一同生效/回滚；无效编辑整体回滚，
+原结果保留）；`POST /api/correlate` 的“读输入→计算→发布”与
+`POST /api/decisions` 的“校验→写入”全程持有 SQLite 写锁
+（`BEGIN IMMEDIATE` + `busy_timeout`，跨进程串行）。下面的脚本（仅用
+Python 标准库）并发轰击这些接口并检查三条不变式，旧实现会打印
+`VIOLATION`：
+
+* **原子可见**：任何一次 `GET /api/state` 都不会看到“新参数 + 旧 `run_id`”
+  的混合状态；
+* **最终一致**：每轮结束后，当前结果要么已失效，要么其 `parameters` 与当前
+  `settings` 完全一致（新结果不会被迟到的失效删掉、旧结果不会残留）；
+* **定案不越界**：定案响应只会是 `200`（先于编辑生效）或 `409`（过期被拒）。
+
+```bash
+docker compose up -d --build
+python3 - <<'PY'
+import json, threading, urllib.request, urllib.error
+
+BASE = "http://localhost:8000"
+
+def api(method, path, body=None):
+    req = urllib.request.Request(BASE + path, method=method)
+    data = None
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+        data = json.dumps(body).encode()
+    try:
+        with urllib.request.urlopen(req, data) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read())
+        except Exception:
+            return e.code, {}
+
+st = api("GET", "/api/state")[1]
+def hole_id(name, n):
+    for b in st["boreholes"]:
+        if b["name"] == name:
+            return b["id"]
+    layers = [{"top": i * 2.0, "bottom": (i + 1) * 2.0, "lithology": "砂岩",
+               "grain": "中粒", "water": "稍湿", "confidence": 0.9}
+              for i in range(n)]
+    return api("POST", "/api/boreholes", {
+        "name": name, "collar_elev": 100, "x": 0 if name == "R" else 10,
+        "layers": layers})[1]["id"]
+
+RID, HID = hole_id("R", 2), hole_id("H", 1)
+ZERO = {"lithology": 0, "grain": 0, "water": 0, "elev": 0, "confidence": 0}
+api("PUT", "/api/settings", {"weights": ZERO, "gap_open": 1e20, "gap_extend": 1})
+_, res = api("POST", "/api/correlate", {"reference_id": RID, "marker_ids": []})
+RUN = res["run_id"]            # 旧页面持有的 run_id
+violations = []
+
+for i in range(30):
+    new_open = 100.0 + i
+    out = {}
+    threads = [
+        threading.Thread(target=lambda: out.__setitem__("put",
+            api("PUT", "/api/settings", {"gap_open": new_open}))),
+        threading.Thread(target=lambda: out.__setitem__("dec",
+            api("POST", "/api/decisions", {"run_id": RUN, "choices":
+                [{"hole_id": HID, "solution_index": 0}]}))),
+        threading.Thread(target=lambda: out.__setitem__("cor",
+            api("POST", "/api/correlate",
+                {"reference_id": RID, "marker_ids": []}))),
+    ]
+    for t in threads: t.start()
+    # 并发期间轮询：不得看到“新参数 + 旧 run_id 结果”的混合状态
+    while any(t.is_alive() for t in threads):
+        s = api("GET", "/api/state")[1]
+        r = s["result"]
+        if r and r.get("run_id") == RUN \
+                and s["settings"]["gap_open"] == new_open:
+            violations.append(("混合状态：新参数与旧 run_id 同时可见", i))
+    for t in threads: t.join()
+    s = api("GET", "/api/state")[1]
+    r = s["result"]
+    # 当前结果要么已失效，要么参数与当前设置完全一致
+    if r is not None \
+            and r["parameters"]["gap_open"] != s["settings"]["gap_open"]:
+        violations.append(("旧结果残留：结果参数落后于当前设置", i))
+    # 重算若读到了新参数，其新结果绝不应被迟到的失效删掉
+    cor_status, cor_body = out["cor"]
+    if cor_status == 200 \
+            and cor_body["parameters"]["gap_open"] == new_open \
+            and s["result"] is None:
+        violations.append(("新结果被迟到的失效删除", i))
+    if out["dec"][0] not in (200, 409):
+        violations.append(("定案状态码异常", i, out["dec"][0]))
+
+print("VIOLATION:" if violations else
+      "OK：编辑/失效原子生效，重算与定案全程串行，无并发窗口")
+for v in violations[:5]:
+    print(" ", v)
+PY
+```
+
+> 竞态窗口本身很窄，脚本靠 30 轮并发碰撞触发；**确定性**复现（用阻塞钩子
+> 精确构造“参数已写入未提交”的交错时序）见回归测试
+> `EditInvalidationConcurrencyHttpTest` 与 `WriteTransactionSerializationTest`：
+> `python3 -m unittest discover -s tests -v`。
+
 ## 功能
 
 - **数据录入**：多口钻孔的孔口高程、水平位置（剖面坐标），以及按深度排列的岩性层段
@@ -238,6 +356,13 @@ curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
   - 定案持久化在 SQLite（`data/correlation.db` 的 `decision` 表），**刷新页面、重启容器后保留**；
     但它们从属于某一次计算（`run_id`）：**重新计算、层段变化、标志层变化、参数变化后
     旧定案立即失效且不再显示**，停留在旧页面的提交/清除请求会被 `409` 拒绝，不能写回新结果。
+  - 并发安全（编辑/失效/重算/定案）：钻孔及层段、标志层、参数的每次编辑与
+    “清除旧结果、旧定案”在**同一个数据库事务**中提交——一同生效、一同回滚，
+    无效编辑整体回滚且**不会清除原有结果**；`POST /api/correlate` 的
+    “读输入→计算→发布”与 `POST /api/decisions` 的“校验→写入”全程持有
+    SQLite 写锁（`BEGIN IMMEDIATE` + `busy_timeout`），多 gunicorn worker
+    进程之间同样串行：重算只发布与其读取输入一致的结果，定案校验与写入
+    不会被编辑或重算的提交插入。
   - 提供「清除全部定案」与单孔「清除」，清除后恢复自动主解。
 
 ## 人工定案：可执行示例
@@ -361,13 +486,14 @@ curl -s -XDELETE $BASE/api/decisions -H 'Content-Type: application/json' \
 
 ```
 app/
-  db.py           SQLite 建表 / 默认参数
+  db.py           SQLite 建表 / 默认参数 / 事务边界（BEGIN IMMEDIATE 写锁、只读快照）
   domain.py       岩性族字典、属性相似度
   correlator.py   三态 DP、标志层分段、正反表歧义判定、并列解枚举、定案展示体构造
   seed.py         内置演示数据
-  routes.py       Flask 路由（含人工定案 /api/decisions 与 run_id 代次校验）
+  routes.py       Flask 路由（含人工定案 /api/decisions 与 run_id 代次校验；
+                  编辑与结果失效同一事务提交，写请求持写锁跨进程串行）
   static/         index.html / style.css / app.js（原生前端，SVG 剖面）
-tests/            并列解计数口径回归测试（unittest，无需 Flask）
+tests/            并列解计数口径与并发窗口回归测试（unittest，核心用例无需 Flask）
 wsgi.py           开发入口 & gunicorn 入口
 Dockerfile / docker-compose.yml
 ```

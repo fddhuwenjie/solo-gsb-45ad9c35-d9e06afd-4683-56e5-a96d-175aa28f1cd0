@@ -30,6 +30,14 @@ gap_extend=9.99999999999e19 时端层代价 -(open+extend)=-1.999999999999e20，
 对噪声留数十倍余量，又远小于 3052 ULP 的真实分差；逐位相等（0 ULP）的
 真正并列（含锁定标志层下、多段组合的真并列）一律保留。
 
+并发窗口（本回归）：修复前 PUT /api/settings 把“写参数”与“清结果/定案”
+分成两个事务，两事务之间旧页面仍可用原 run_id 向 POST /api/decisions 定案
+并收到 200（随后被迟到的失效抹掉）；若此时 POST /api/correlate 算出新
+run_id，迟到的失效又会删掉新结果。修复后编辑与失效同一事务（一同生效 /
+回滚），重算与定案在校验到写入全程持有数据库写锁（BEGIN IMMEDIATE，
+跨 gunicorn 进程同样串行）。见 EditInvalidationConcurrencyHttpTest（需
+Flask）与 WriteTransactionSerializationTest（纯 SQLite，无需 Flask）。
+
 运行：python -m unittest discover -s tests -v
 """
 import unittest
@@ -1075,6 +1083,414 @@ class BuildChoiceTest(unittest.TestCase):
         anchors = {(p["ref_layer_id"], p["hole_layer_id"])
                    for p in view["pairs"] if p["marker"]}
         self.assertEqual(anchors, {(102, 202)})
+
+
+class WriteTransactionSerializationTest(unittest.TestCase):
+    """db.begin_write 的写锁跨连接串行（等价于跨 gunicorn 进程）。
+
+    纯 SQLite 层回归，无需 Flask：验证修复所依赖的事务原语——
+    BEGIN IMMEDIATE 让后到的写事务排队并读到前者提交后的最新状态；
+    finally 中的兜底 rollback 在已提交后是无操作（不会误回滚）。
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from app import db as dbmod
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_db_path = dbmod.DB_PATH
+        dbmod.DB_PATH = Path(self._tmp.name) / "t.db"
+        dbmod.init_db()
+
+    def tearDown(self):
+        from app import db as dbmod
+        dbmod.DB_PATH = self._orig_db_path
+        if hasattr(self, "_tmp"):
+            self._tmp.cleanup()
+
+    def test_begin_write_serializes_writers_across_connections(self):
+        import threading
+        import time
+        from app import db as dbmod
+        a = dbmod.get_db()
+        dbmod.begin_write(a)
+        a.execute("UPDATE settings SET payload=? WHERE id=1", ('{"v": 1}',))
+        seen = {}
+
+        def other_writer():
+            b = dbmod.get_db()
+            try:
+                dbmod.begin_write(b)      # 必须阻塞，直到 a 提交
+                seen["payload"] = b.execute(
+                    "SELECT payload FROM settings WHERE id=1"
+                ).fetchone()["payload"]
+                b.commit()
+            finally:
+                b.close()
+
+        t = threading.Thread(target=other_writer)
+        t.start()
+        time.sleep(0.3)
+        # a 持有写锁期间，另一连接的写事务进不来（跨进程同理）
+        self.assertNotIn("payload", seen)
+        a.commit()
+        a.close()
+        t.join(10)
+        self.assertNotEqual(t.is_alive(), True)
+        # 后到写事务读到的是 a 提交后的最新状态
+        self.assertEqual(seen["payload"], '{"v": 1}')
+
+    def test_rollback_after_commit_is_safe_noop(self):
+        from app import db as dbmod
+        conn = dbmod.get_db()
+        dbmod.begin_write(conn)
+        conn.execute("UPDATE settings SET payload=? WHERE id=1", ('{"v": 2}',))
+        conn.commit()
+        conn.rollback()     # finally 兜底：已提交时为无操作，不抛异常
+        conn.close()
+        check = dbmod.get_db()
+        try:
+            self.assertEqual(
+                check.execute("SELECT payload FROM settings WHERE id=1")
+                .fetchone()["payload"], '{"v": 2}')
+        finally:
+            check.close()
+
+
+class EditInvalidationConcurrencyHttpTest(unittest.TestCase):
+    """编辑提交与结果失效之间的并发窗口回归（任务反例）。
+
+    修复前：PUT /api/settings 把“写参数”和“清结果/定案”分成两个事务——
+    两事务之间旧页面仍可用原 run_id 向 POST /api/decisions 定案并收到 200
+    （随后被迟到的失效事务抹掉）；若此时 POST /api/correlate 算出新
+    run_id，迟到的失效又会删掉新结果。修复后：编辑与失效同一事务
+    （一同生效 / 回滚），重算与定案在校验到写入全程持有数据库写锁
+    （BEGIN IMMEDIATE，跨 gunicorn 进程同样串行）。
+
+    需要 Flask；无 Flask 的最小环境自动跳过（Docker 镜像内必跑）。
+    """
+
+    def setUp(self):
+        try:
+            import flask  # noqa: F401
+        except ImportError:
+            self.skipTest("未安装 Flask，端到端用例在 Docker 内运行")
+        import tempfile
+        from pathlib import Path
+        from app import db as dbmod
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_db_path = dbmod.DB_PATH
+        dbmod.DB_PATH = Path(self._tmp.name) / "t.db"
+        dbmod.init_db()
+        from app.routes import app
+        self.app = app
+        self.client = app.test_client()
+
+    def tearDown(self):
+        from app import db as dbmod
+        dbmod.DB_PATH = self._orig_db_path
+        if hasattr(self, "_tmp"):
+            self._tmp.cleanup()
+
+    def _hole(self, name, n):
+        layers = [
+            {"top": i * 2.0, "bottom": (i + 1) * 2.0,
+             "lithology": "砂岩", "grain": "中粒", "water": "稍湿",
+             "confidence": 0.9}
+            for i in range(n)
+        ]
+        resp = self.client.post("/api/boreholes", json={
+            "name": name, "collar_elev": 100, "x": 0 if name == "R" else 10,
+            "layers": layers})
+        self.assertEqual(resp.status_code, 201, resp.data)
+        return resp.get_json()["id"]
+
+    def _setup_tie(self):
+        """2 参考层 / 1 待校核层、全零权重、gap_open=1e20：2 个并列归属。"""
+        rid = self._hole("R", 2)
+        hid = self._hole("H", 1)
+        self.client.put("/api/settings", json={
+            "weights": {"lithology": 0, "grain": 0, "water": 0,
+                        "elev": 0, "confidence": 0},
+            "gap_open": 1e20, "gap_extend": 1})
+        res = self.client.post(
+            "/api/correlate",
+            json={"reference_id": rid, "marker_ids": []}).get_json()
+        self.assertEqual(res["holes"][0]["solution_count"], 2)
+        return rid, hid, res
+
+    def _state(self):
+        return self.client.get("/api/state").get_json()
+
+    def _orphan_decisions(self):
+        """decision 表中不属于当前 run_id 的“孤儿”行数（应恒为 0）。"""
+        from app import db as dbmod
+        conn = dbmod.get_db()
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) c FROM decision d"
+                " LEFT JOIN run_result r ON r.id=1"
+                " WHERE r.run_id IS NULL OR d.run_id <> r.run_id"
+            ).fetchone()["c"]
+        finally:
+            conn.close()
+
+    # ---- 无效编辑不能清除原有结果 ----
+
+    def test_invalid_settings_edit_keeps_result_and_decisions(self):
+        _rid, hid, res = self._setup_tie()
+        self.client.post("/api/decisions", json={
+            "run_id": res["run_id"],
+            "choices": [{"hole_id": hid, "solution_index": 1}]})
+        resp = self.client.put("/api/settings", json={"gap_open": -5})
+        self.assertEqual(resp.status_code, 400)
+        st = self._state()
+        self.assertEqual(st["settings"]["gap_open"], 1e20)   # 参数未被改动
+        self.assertIsNotNone(st["result"])                   # 结果未被清除
+        self.assertEqual(st["result"]["run_id"], res["run_id"])
+        self.assertEqual(
+            st["result"]["holes"][0]["decision"]["solution_index"], 1)
+
+    def test_invalid_layer_edit_keeps_result(self):
+        rid, _hid, res = self._setup_tie()
+        resp = self.client.put(f"/api/boreholes/{rid}", json={"layers": [
+            {"top": 0, "bottom": 3, "lithology": "砂岩"},
+            {"top": 2, "bottom": 4, "lithology": "泥岩"}]})   # 深度重叠
+        self.assertEqual(resp.status_code, 400)
+        st = self._state()
+        self.assertIsNotNone(st["result"])
+        self.assertEqual(st["result"]["run_id"], res["run_id"])
+        rhole = next(b for b in st["boreholes"] if b["id"] == rid)
+        self.assertEqual(len(rhole["layers"]), 2)            # 原层段未动
+
+    def test_invalid_marker_create_keeps_result(self):
+        _rid, hid, res = self._setup_tie()
+        markers_before = self._state()["markers"]
+        resp = self.client.post("/api/markers", json={
+            "label": "BAD", "links": {str(hid): 999999}})   # 链接不存在的层
+        self.assertEqual(resp.status_code, 400)             # 修复前为 500
+        st = self._state()
+        self.assertEqual(st["markers"], markers_before)     # 标志层未落库
+        self.assertIsNotNone(st["result"])
+        self.assertEqual(st["result"]["run_id"], res["run_id"])
+
+    # ---- 业务数据与旧结果、旧定案一同生效或一同回滚 ----
+
+    def test_failed_invalidation_rolls_back_settings_edit(self):
+        _rid, hid, res = self._setup_tie()
+        self.client.post("/api/decisions", json={
+            "run_id": res["run_id"],
+            "choices": [{"hole_id": hid, "solution_index": 1}]})
+        import app.routes as routes
+        orig = routes._invalidate_result
+
+        def boom(conn):
+            raise RuntimeError("模拟失效步骤故障")
+        routes._invalidate_result = boom
+        try:
+            resp = self.client.put("/api/settings", json={"gap_open": 7.0})
+            self.assertEqual(resp.status_code, 500)
+        finally:
+            routes._invalidate_result = orig
+        st = self._state()
+        # 参数写入随失效故障一并回滚；原结果与定案保持有效
+        self.assertEqual(st["settings"]["gap_open"], 1e20)
+        self.assertIsNotNone(st["result"])
+        self.assertEqual(st["result"]["run_id"], res["run_id"])
+        self.assertEqual(
+            st["result"]["holes"][0]["decision"]["solution_index"], 1)
+
+    # ---- 任务反例 A：定案不能插入“参数已提交、旧结果未清”的窗口 ----
+
+    def test_decision_submit_serializes_against_settings_edit(self):
+        import threading
+        import app.routes as routes
+        _rid, hid, res = self._setup_tie()
+        run_id = res["run_id"]
+
+        orig = routes._invalidate_result
+        entered = threading.Event()   # 设置事务已持锁并写入新参数（未提交）
+        release = threading.Event()   # 允许设置事务继续（失效并提交）
+
+        def blocking_invalidate(conn):
+            entered.set()
+            release.wait(10)
+            return orig(conn)
+        routes._invalidate_result = blocking_invalidate
+
+        put_result, dec_result = {}, {}
+
+        def do_put():
+            c = self.app.test_client()
+            put_result["status"] = c.put(
+                "/api/settings", json={"gap_open": 7.0}).status_code
+
+        def do_decision():
+            c = self.app.test_client()
+            dec_result["status"] = c.post("/api/decisions", json={
+                "run_id": run_id,
+                "choices": [{"hole_id": hid, "solution_index": 0}],
+            }).status_code
+
+        try:
+            t_put = threading.Thread(target=do_put)
+            t_put.start()
+            self.assertTrue(entered.wait(10))
+            # 此时新参数已在设置事务内写入但未提交——旧代码中这里正是
+            # “参数已提交、旧结果未清”的窗口，旧 run_id 定案能拿到 200 随后
+            # 被抹掉。修复后定案被写锁挡住，直到设置事务提交后才校验。
+            t_dec = threading.Thread(target=do_decision)
+            t_dec.start()
+            t_dec.join(1.0)
+            self.assertNotIn("status", dec_result)   # 定案被串行化阻塞
+            release.set()
+            t_put.join(10)
+            t_dec.join(10)
+        finally:
+            release.set()
+            routes._invalidate_result = orig
+        self.assertEqual(put_result["status"], 200)
+        # 设置事务提交后结果已失效：迟到的定案只能 409，不会 200 后被抹掉
+        self.assertEqual(dec_result["status"], 409)
+        self.assertIsNone(self._state()["result"])
+        self.assertEqual(self._orphan_decisions(), 0)
+
+    # ---- 任务反例 B：迟到的失效不能删掉其后发布的新结果 ----
+
+    def test_delayed_invalidation_cannot_delete_fresh_result(self):
+        import threading
+        import app.routes as routes
+        rid, _hid, _res = self._setup_tie()
+
+        orig = routes._invalidate_result
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_invalidate(conn):
+            entered.set()
+            release.wait(10)
+            return orig(conn)
+        routes._invalidate_result = blocking_invalidate
+
+        put_result, cor_result = {}, {}
+
+        def do_put():
+            c = self.app.test_client()
+            put_result["status"] = c.put(
+                "/api/settings", json={"gap_open": 7.0}).status_code
+
+        def do_correlate():
+            c = self.app.test_client()
+            r = c.post("/api/correlate",
+                       json={"reference_id": rid, "marker_ids": []})
+            cor_result["status"] = r.status_code
+            cor_result["body"] = r.get_json()
+
+        try:
+            t_put = threading.Thread(target=do_put)
+            t_put.start()
+            self.assertTrue(entered.wait(10))
+            # 旧代码：失效是独立事务，此窗口内发布的重算结果会被随后提交
+            # 的迟到失效删掉。修复后重算被写锁串行化：它在设置事务提交后
+            # 读到新参数，发布的新结果不会被误删。
+            t_cor = threading.Thread(target=do_correlate)
+            t_cor.start()
+            t_cor.join(1.0)
+            self.assertNotIn("status", cor_result)   # 重算被串行化阻塞
+            release.set()
+            t_put.join(10)
+            t_cor.join(10)
+        finally:
+            release.set()
+            routes._invalidate_result = orig
+        self.assertEqual(put_result["status"], 200)
+        self.assertEqual(cor_result["status"], 200)
+        body = cor_result["body"]
+        # 重算读到的是设置事务提交后的新参数
+        self.assertEqual(body["parameters"]["gap_open"], 7.0)
+        # 新结果必须存活：run_id 与本次重算一致，参数与当前设置一致
+        st = self._state()
+        self.assertIsNotNone(st["result"])
+        self.assertEqual(st["result"]["run_id"], body["run_id"])
+        self.assertEqual(st["result"]["parameters"]["gap_open"], 7.0)
+        self.assertEqual(st["settings"]["gap_open"], 7.0)
+
+    # ---- 并发编辑 + 重算：最终状态恒一致 ----
+
+    def test_concurrent_edits_and_recomputes_leave_consistent_state(self):
+        import threading
+        rid, _hid, _res = self._setup_tie()
+        for round_no in range(6):
+            new_open = 3.0 + round_no
+            outcomes = {}
+
+            def do_put():
+                c = self.app.test_client()
+                outcomes["put"] = c.put(
+                    "/api/settings", json={"gap_open": new_open}).status_code
+
+            def do_correlate():
+                c = self.app.test_client()
+                r = c.post("/api/correlate",
+                           json={"reference_id": rid, "marker_ids": []})
+                outcomes["cor"] = (r.status_code, r.get_json())
+
+            threads = [threading.Thread(target=do_put),
+                       threading.Thread(target=do_correlate)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+            self.assertEqual(outcomes["put"], 200)
+            self.assertEqual(outcomes["cor"][0], 200)
+            st = self._state()
+            # 不变式：当前结果要么已失效，要么就是本轮重算发布的那一份，
+            # 且其参数与当前设置完全一致（不会被迟到失效删掉或留下旧参数）
+            if st["result"] is not None:
+                self.assertEqual(st["result"]["run_id"],
+                                 outcomes["cor"][1]["run_id"])
+                params = st["result"]["parameters"]
+                self.assertEqual(params["gap_open"],
+                                 st["settings"]["gap_open"])
+                self.assertEqual(params["gap_extend"],
+                                 st["settings"]["gap_extend"])
+                self.assertEqual(params["elev_scale"],
+                                 st["settings"]["elev_scale"])
+                self.assertEqual(params["weights"],
+                                 st["settings"]["weights"])
+            self.assertEqual(self._orphan_decisions(), 0)
+
+    # ---- 并发定案 + 重算：定案要么生效于旧 run、要么 409，绝不留下孤儿 ----
+
+    def test_concurrent_decisions_and_recompute_never_orphan(self):
+        import threading
+        rid, hid, _res = self._setup_tie()
+        for _ in range(6):
+            run_id = self._state()["result"]["run_id"]
+            outcomes = {}
+
+            def do_decision():
+                c = self.app.test_client()
+                outcomes["dec"] = c.post("/api/decisions", json={
+                    "run_id": run_id,
+                    "choices": [{"hole_id": hid, "solution_index": 0}],
+                }).status_code
+
+            def do_correlate():
+                c = self.app.test_client()
+                outcomes["cor"] = c.post("/api/correlate", json={
+                    "reference_id": rid, "marker_ids": []}).status_code
+
+            threads = [threading.Thread(target=do_decision),
+                       threading.Thread(target=do_correlate)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+            self.assertEqual(outcomes["cor"], 200)
+            # 定案在旧 run 上要么成功（随后被重算作废）、要么因过期被拒
+            self.assertIn(outcomes["dec"], (200, 409))
+            self.assertEqual(self._orphan_decisions(), 0)
 
 
 if __name__ == "__main__":

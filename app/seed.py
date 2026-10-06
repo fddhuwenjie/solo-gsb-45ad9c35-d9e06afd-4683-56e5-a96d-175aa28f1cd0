@@ -74,6 +74,11 @@ MARKERS = [
 
 
 def seed_if_empty(conn):
+    """钻孔表为空时写入演示数据。
+
+    不自行提交：调用方在写事务内使用，与同一事务的其它写入（如演示重置
+    时的清库、结果失效）一并提交或回滚。
+    """
     count = conn.execute("SELECT COUNT(*) c FROM borehole").fetchone()["c"]
     if count:
         return False
@@ -105,5 +110,4 @@ def seed_if_empty(conn):
                 " VALUES (?,?,?)",
                 (mid, hole_ids[name], layer_id[(name, seq)]),
             )
-    conn.commit()
     return True

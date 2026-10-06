@@ -57,22 +57,15 @@ def _attach_decisions(conn, result):
     return result
 
 
-def _load_result(conn=None):
+def _load_result(conn):
     """最近一次关联结果（持久化，多 worker 共享），并挂上当前定案。"""
-    own = conn is None
-    if own:
-        conn = dbmod.get_db()
-    try:
-        row = conn.execute(
-            "SELECT payload, run_id FROM run_result WHERE id=1"
-        ).fetchone()
-        result = json.loads(row["payload"]) if row and row["payload"] else None
-        if result is not None and row["run_id"]:
-            result["run_id"] = row["run_id"]
-        return _attach_decisions(conn, result)
-    finally:
-        if own:
-            conn.close()
+    row = conn.execute(
+        "SELECT payload, run_id FROM run_result WHERE id=1"
+    ).fetchone()
+    result = json.loads(row["payload"]) if row and row["payload"] else None
+    if result is not None and row["run_id"]:
+        result["run_id"] = row["run_id"]
+    return _attach_decisions(conn, result)
 
 
 def _save_result(conn, result, run_id):
@@ -87,18 +80,16 @@ def _save_result(conn, result, run_id):
     )
 
 
-def _invalidate_result(conn=None):
-    """层段 / 标志层 / 参数变化或演示重置：结果与全部定案一并失效。"""
-    own = conn is None
-    if own:
-        conn = dbmod.get_db()
-    try:
-        conn.execute("UPDATE run_result SET payload=NULL, run_id=NULL WHERE id=1")
-        conn.execute("DELETE FROM decision")
-        conn.commit()
-    finally:
-        if own:
-            conn.close()
+def _invalidate_result(conn):
+    """层段 / 标志层 / 参数变化或演示重置：结果与全部定案一并失效。
+
+    必须在调用方的写事务内调用：失效与业务数据写入同一个事务提交，
+    二者要么一同生效、要么一同回滚。其他请求永远看不到“业务数据已改、
+    旧结果未清”（或相反）的中间状态；也不存在迟到的独立失效事务，
+    把其后已发布的新结果误删。
+    """
+    conn.execute("UPDATE run_result SET payload=NULL, run_id=NULL WHERE id=1")
+    conn.execute("DELETE FROM decision")
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +164,7 @@ def api_config():
 def api_state():
     conn = dbmod.get_db()
     try:
+        dbmod.begin_read(conn)
         return jsonify({
             "boreholes": _all_boreholes(conn),
             "markers": _all_markers(conn),
@@ -180,6 +172,7 @@ def api_state():
             "result": _load_result(conn),
         })
     finally:
+        conn.rollback()
         conn.close()
 
 
@@ -252,6 +245,7 @@ def api_borehole_create():
         return bad("水平位置 / 孔口高程必须是数字")
     conn = dbmod.get_db()
     try:
+        dbmod.begin_write(conn)
         if conn.execute("SELECT 1 FROM borehole WHERE name=?", (name,)).fetchone():
             return bad(f"孔名「{name}」已存在")
         cur = conn.execute(
@@ -262,13 +256,15 @@ def api_borehole_create():
         try:
             _save_layers(conn, hole_id, data.get("layers", []))
         except ValueError as e:
-            conn.rollback()
+            # finally 回滚：孔与层都不落库，原有结果与定案保持有效
             return bad(str(e))
+        # 业务数据与旧结果、旧定案的失效在同一事务内生效
+        _invalidate_result(conn)
         conn.commit()
-        _invalidate_result()
         row = conn.execute("SELECT * FROM borehole WHERE id=?", (hole_id,)).fetchone()
         return jsonify(_borehole(conn, row)), 201
     finally:
+        conn.rollback()
         conn.close()
 
 
@@ -277,6 +273,7 @@ def api_borehole_update(hole_id):
     data = request.get_json(force=True, silent=True) or {}
     conn = dbmod.get_db()
     try:
+        dbmod.begin_write(conn)
         row = conn.execute("SELECT * FROM borehole WHERE id=?", (hole_id,)).fetchone()
         if row is None:
             return bad("钻孔不存在", 404)
@@ -299,13 +296,13 @@ def api_borehole_update(hole_id):
             try:
                 _save_layers(conn, hole_id, data["layers"])
             except ValueError as e:
-                conn.rollback()
-                return bad(str(e))
+                return bad(str(e))      # finally 回滚：层段与结果均保持原样
+        _invalidate_result(conn)
         conn.commit()
-        _invalidate_result()
         row = conn.execute("SELECT * FROM borehole WHERE id=?", (hole_id,)).fetchone()
         return jsonify(_borehole(conn, row))
     finally:
+        conn.rollback()
         conn.close()
 
 
@@ -313,11 +310,13 @@ def api_borehole_update(hole_id):
 def api_borehole_delete(hole_id):
     conn = dbmod.get_db()
     try:
+        dbmod.begin_write(conn)
         conn.execute("DELETE FROM borehole WHERE id=?", (hole_id,))
+        _invalidate_result(conn)
         conn.commit()
-        _invalidate_result()
         return jsonify({"ok": True})
     finally:
+        conn.rollback()
         conn.close()
 
 
@@ -333,6 +332,7 @@ def api_marker_create():
         return bad("标志层标签不能为空")
     conn = dbmod.get_db()
     try:
+        dbmod.begin_write(conn)
         if conn.execute("SELECT 1 FROM marker WHERE label=?", (label,)).fetchone():
             return bad(f"标志层「{label}」已存在")
         cur = conn.execute(
@@ -340,11 +340,16 @@ def api_marker_create():
             (label, data.get("description", "")),
         )
         mid = cur.lastrowid
-        _save_marker_links(conn, mid, data.get("links", {}))
+        try:
+            _save_marker_links(conn, mid, data.get("links", {}))
+        except ValueError as e:
+            # finally 回滚：标志层不落库，原有结果与定案保持有效
+            return bad(str(e))
+        _invalidate_result(conn)
         conn.commit()
-        _invalidate_result()
         return jsonify({"id": mid}), 201
     finally:
+        conn.rollback()
         conn.close()
 
 
@@ -369,6 +374,7 @@ def api_marker_update(marker_id):
     data = request.get_json(force=True, silent=True) or {}
     conn = dbmod.get_db()
     try:
+        dbmod.begin_write(conn)
         if not conn.execute("SELECT 1 FROM marker WHERE id=?", (marker_id,)).fetchone():
             return bad("标志层不存在", 404)
         label = (data.get("label") or "").strip()
@@ -387,12 +393,12 @@ def api_marker_update(marker_id):
             try:
                 _save_marker_links(conn, marker_id, data["links"])
             except ValueError as e:
-                conn.rollback()
                 return bad(str(e))
+        _invalidate_result(conn)
         conn.commit()
-        _invalidate_result()
         return jsonify({"ok": True})
     finally:
+        conn.rollback()
         conn.close()
 
 
@@ -400,11 +406,13 @@ def api_marker_update(marker_id):
 def api_marker_delete(marker_id):
     conn = dbmod.get_db()
     try:
+        dbmod.begin_write(conn)
         conn.execute("DELETE FROM marker WHERE id=?", (marker_id,))
+        _invalidate_result(conn)
         conn.commit()
-        _invalidate_result()
         return jsonify({"ok": True})
     finally:
+        conn.rollback()
         conn.close()
 
 
@@ -417,6 +425,9 @@ def api_settings_update():
     data = request.get_json(force=True, silent=True) or {}
     conn = dbmod.get_db()
     try:
+        # 写事务从校验之前开始：校验失败（下面的 400 返回）经 finally 回滚，
+        # 原有结果与定案保持不变；校验通过则参数写入与结果失效同一事务提交。
+        dbmod.begin_write(conn)
         cur = _settings(conn)
         if "weights" in data:
             w = data["weights"]
@@ -440,11 +451,14 @@ def api_settings_update():
                 cur[k] = v
         conn.execute("UPDATE settings SET payload=? WHERE id=1",
                      (json.dumps(cur, ensure_ascii=False),))
+        # 参数变化后旧结果与其人工定案均失效（下一次重算生成新 run_id）；
+        # 失效与参数写入是同一个事务：不存在“参数已提交、旧结果暂未清”的
+        # 窗口，旧页面不可能在该窗口内用旧 run_id 定案成功。
+        _invalidate_result(conn)
         conn.commit()
-        # 参数变化后旧结果与其人工定案均失效（下一次重算生成新 run_id）
-        _invalidate_result()
         return jsonify(cur)
     finally:
+        conn.rollback()
         conn.close()
 
 
@@ -468,6 +482,9 @@ def api_correlate():
         return bad("请选择参考孔")
     conn = dbmod.get_db()
     try:
+        # 整个“读输入 → 计算 → 发布”在同一写事务内：写锁保证编辑 / 定案 /
+        # 另一次重算不可能插入其中，发布的结果恰好对应读取时的输入。
+        dbmod.begin_write(conn)
         holes = {r["id"]: _borehole(conn, r) for r in
                  conn.execute("SELECT * FROM borehole").fetchall()}
         if ref_id not in holes:
@@ -605,16 +622,24 @@ def api_correlate():
                                 "marker_ids": result["locked_marker_ids"]}
         conn.execute("UPDATE settings SET payload=? WHERE id=1",
                      (json.dumps(settings, ensure_ascii=False),))
-        conn.commit()
         # 新计算尚无定案；附上空 decision / effective 视图后返回
-        return jsonify(_attach_decisions(conn, result))
+        result = _attach_decisions(conn, result)
+        conn.commit()
+        return jsonify(result)
     finally:
+        conn.rollback()
         conn.close()
 
 
 @app.get("/api/result")
 def api_result():
-    return jsonify(_load_result())
+    conn = dbmod.get_db()
+    try:
+        dbmod.begin_read(conn)
+        return jsonify(_load_result(conn))
+    finally:
+        conn.rollback()
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -652,6 +677,10 @@ def api_decisions_submit():
 
     conn = dbmod.get_db()
     try:
+        # 校验与写入全程持有写锁：编辑（层段/标志层/参数）或重算的提交
+        # 不可能插入“读 run_id 校验”与“写定案”之间——即使请求来自另一
+        # 个 gunicorn worker 进程，数据库锁同样生效。
+        dbmod.begin_write(conn)
         try:
             cur_run, result = _current_run(conn)
         except ValueError as e:
@@ -738,9 +767,11 @@ def api_decisions_submit():
                 (cur_run, hid, idx,
                  json.dumps(view, ensure_ascii=False), now),
             )
+        result = _attach_decisions(conn, result)
         conn.commit()
-        return jsonify(_attach_decisions(conn, result))
+        return jsonify(result)
     finally:
+        conn.rollback()
         conn.close()
 
 
@@ -756,6 +787,7 @@ def api_decisions_clear():
     data = request.get_json(force=True, silent=True) or {}
     conn = dbmod.get_db()
     try:
+        dbmod.begin_write(conn)
         row = conn.execute(
             "SELECT payload, run_id FROM run_result WHERE id=1"
         ).fetchone()
@@ -777,9 +809,11 @@ def api_decisions_clear():
             )
         else:
             conn.execute("DELETE FROM decision WHERE run_id=?", (cur_run,))
+        result = _attach_decisions(conn, json.loads(row["payload"]))
         conn.commit()
-        return jsonify(_attach_decisions(conn, json.loads(row["payload"])))
+        return jsonify(result)
     finally:
+        conn.rollback()
         conn.close()
 
 
@@ -791,6 +825,7 @@ def api_decisions_clear():
 def api_export():
     conn = dbmod.get_db()
     try:
+        dbmod.begin_read(conn)
         payload = {
             "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "tool": "钻孔地层关联校核台",
@@ -800,7 +835,9 @@ def api_export():
             # last_result 已按 run_id 挂上人工定案（hole.decision / effective）
             "last_result": _load_result(conn),
         }
+        conn.commit()
     finally:
+        conn.rollback()
         conn.close()
     fname = time.strftime("correlation_%Y%m%d_%H%M%S.json")
     from flask import Response
@@ -814,29 +851,34 @@ def api_export():
 def api_demo_reset():
     conn = dbmod.get_db()
     try:
+        dbmod.begin_write(conn)
         conn.execute("DELETE FROM marker_layer")
         conn.execute("DELETE FROM marker")
         conn.execute("DELETE FROM layer")
         conn.execute("DELETE FROM borehole")
-        conn.commit()
         seed_if_empty(conn)
         # 清除上次运行选择（id 已因重建变化）
         settings = _settings(conn)
         settings.pop("last_run", None)
         conn.execute("UPDATE settings SET payload=? WHERE id=1",
                      (json.dumps(settings, ensure_ascii=False),))
+        _invalidate_result(conn)
         conn.commit()
+        return jsonify({"ok": True})
     finally:
+        conn.rollback()
         conn.close()
-    _invalidate_result()
-    return jsonify({"ok": True})
 
 
 def create_app():
     dbmod.init_db()
     conn = dbmod.get_db()
     try:
+        # 多 worker 首次启动可能并发进入：种子写在写锁内串行执行
+        dbmod.begin_write(conn)
         seed_if_empty(conn)
+        conn.commit()
     finally:
+        conn.rollback()
         conn.close()
     return app

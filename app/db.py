@@ -79,10 +79,32 @@ DEFAULT_SETTINGS = {
 
 
 def get_db():
-    conn = sqlite3.connect(str(DB_PATH))
+    # isolation_level=None：关闭 sqlite3 模块的隐式事务，事务边界由路由
+    # 显式控制（否则 SELECT 与后续写入分属不同事务，读-校验-写之间会被
+    # 其他连接的提交插入）。timeout=30：写锁被其他连接/进程持有时最多
+    # 等待 30s（busy_timeout），多 gunicorn worker 下写请求彼此排队，
+    # 而不是立即报 database is locked。
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def begin_write(conn):
+    """开启写事务并立即取得数据库级写锁（BEGIN IMMEDIATE）。
+
+    写锁跨连接、跨进程生效：本事务提交或回滚之前，其他连接的写事务只能
+    排队等待（busy_timeout 内），因此事务内的“读-校验-写”不会被其他
+    写者（编辑 / 重算 / 定案）的提交插入；首个读语句看到的就是最新已
+    提交状态，且提交前不会有其他写者再改变它。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+
+
+def begin_read(conn):
+    """开启只读快照事务：首个 SELECT 起持有共享锁，此后多语句读到同一
+    快照；不阻塞其他读者，也不阻塞写者开始（仅在其提交瞬间短暂互斥）。"""
+    conn.execute("BEGIN")
 
 
 def init_db():
